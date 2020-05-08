@@ -33,11 +33,14 @@ import android.text.TextPaint;
 import android.text.TextUtils;
 import android.text.style.AbsoluteSizeSpan;
 import android.text.style.BackgroundColorSpan;
+import android.text.style.ForegroundColorSpan;
 import android.text.style.RelativeSizeSpan;
 import android.util.DisplayMetrics;
 import androidx.annotation.Nullable;
 import com.google.android.exoplayer2.text.CaptionStyleCompat;
 import com.google.android.exoplayer2.text.Cue;
+import com.google.android.exoplayer2.text.ssa.spans.OutlineStyleSpan;
+import com.google.android.exoplayer2.text.ssa.spans.ShadowStyleSpan;
 import com.google.android.exoplayer2.util.Assertions;
 import com.google.android.exoplayer2.util.Log;
 import com.google.android.exoplayer2.util.Util;
@@ -64,7 +67,8 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
   private final float spacingAdd;
 
   private final TextPaint textPaint;
-  private final Paint paint;
+  private final Paint windowPaint;
+  private final Paint bitmapPaint;
 
   // Previous input variables.
   @Nullable private CharSequence cueText;
@@ -98,10 +102,14 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 
   // Derived drawing variables.
   private @MonotonicNonNull StaticLayout textLayout;
+  private @MonotonicNonNull StaticLayout edgeLayout;
   private int textLeft;
   private int textTop;
   private int textPaddingX;
   private @MonotonicNonNull Rect bitmapRect;
+
+  private @Nullable OutlineStyleSpan mOutlineSpan;
+  private @Nullable ShadowStyleSpan mShadowSpan;
 
   @SuppressWarnings("ResourceType")
   public SubtitlePainter(Context context) {
@@ -122,9 +130,13 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
     textPaint.setAntiAlias(true);
     textPaint.setSubpixelText(true);
 
-    paint = new Paint();
-    paint.setAntiAlias(true);
-    paint.setStyle(Style.FILL);
+    windowPaint = new Paint();
+    windowPaint.setAntiAlias(true);
+    windowPaint.setStyle(Style.FILL);
+
+    bitmapPaint = new Paint();
+    bitmapPaint.setAntiAlias(true);
+    bitmapPaint.setFilterBitmap(true);
   }
 
   /**
@@ -240,7 +252,10 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 
   @RequiresNonNull("cueText")
   private void setupTextLayout() {
-    CharSequence cueText = this.cueText;
+    SpannableStringBuilder cueText =
+        this.cueText instanceof SpannableStringBuilder
+            ? (SpannableStringBuilder) this.cueText
+            : new SpannableStringBuilder(this.cueText);
     int parentWidth = parentRight - parentLeft;
     int parentHeight = parentBottom - parentTop;
 
@@ -258,39 +273,67 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 
     // Remove embedded styling or font size if requested.
     if (!applyEmbeddedStyles) {
-      cueText = cueText.toString(); // Equivalent to erasing all spans.
+      // Remove all spans, regardless of type.
+      for (Object span : cueText.getSpans(0, cueText.length(), Object.class)) {
+        cueText.removeSpan(span);
+      }
     } else if (!applyEmbeddedFontSizes) {
-      SpannableStringBuilder newCueText = new SpannableStringBuilder(cueText);
-      int cueLength = newCueText.length();
-      AbsoluteSizeSpan[] absSpans = newCueText.getSpans(0, cueLength, AbsoluteSizeSpan.class);
-      RelativeSizeSpan[] relSpans = newCueText.getSpans(0, cueLength, RelativeSizeSpan.class);
+      AbsoluteSizeSpan[] absSpans = cueText.getSpans(0, cueText.length(), AbsoluteSizeSpan.class);
       for (AbsoluteSizeSpan absSpan : absSpans) {
-        newCueText.removeSpan(absSpan);
+        cueText.removeSpan(absSpan);
       }
+      RelativeSizeSpan[] relSpans = cueText.getSpans(0, cueText.length(), RelativeSizeSpan.class);
       for (RelativeSizeSpan relSpan : relSpans) {
-        newCueText.removeSpan(relSpan);
+        cueText.removeSpan(relSpan);
       }
-      cueText = newCueText;
     } else {
       // Apply embedded styles & font size.
       if (cueTextSizePx > 0) {
-        // Use a SpannableStringBuilder encompassing the whole cue text to apply the default
-        // cueTextSizePx.
-        SpannableStringBuilder newCueText = new SpannableStringBuilder(cueText);
-        newCueText.setSpan(
+        // Use an AbsoluteSizeSpan encompassing the whole text to apply the default cueTextSizePx.
+        cueText.setSpan(
             new AbsoluteSizeSpan((int) cueTextSizePx),
             /* start= */ 0,
-            /* end= */ newCueText.length(),
+            /* end= */ cueText.length(),
             Spanned.SPAN_PRIORITY);
-        cueText = newCueText;
       }
     }
 
+    OutlineStyleSpan[] outlineStyleSpans = cueText.getSpans(0, cueText.length(), OutlineStyleSpan.class);
+    if (outlineStyleSpans.length > 0) {
+      mOutlineSpan = outlineStyleSpans[0];
+    }
+
+    ShadowStyleSpan[] shadowStyleSpans = cueText.getSpans(0, cueText.length(), ShadowStyleSpan.class);
+    if (shadowStyleSpans.length > 0) {
+      mShadowSpan = shadowStyleSpans[0];
+    }
+
+    // Remove embedded font color to not destroy edges, otherwise it overrides edge color.
+    SpannableStringBuilder cueTextEdge = new SpannableStringBuilder(cueText);
+    if (edgeType == CaptionStyleCompat.EDGE_TYPE_OUTLINE) {
+      ForegroundColorSpan[] foregroundColorSpans =
+          cueTextEdge.getSpans(0, cueTextEdge.length(), ForegroundColorSpan.class);
+      for (ForegroundColorSpan foregroundColorSpan : foregroundColorSpans) {
+        cueTextEdge.removeSpan(foregroundColorSpan);
+      }
+    }
+
+    // EDGE_TYPE_NONE & EDGE_TYPE_DROP_SHADOW both paint in one pass, they ignore cueTextEdge.
+    // In other cases we use two painters and we need to apply the background in the first one only,
+    // otherwise the background color gets drawn in front of the edge color
+    // (https://github.com/google/ExoPlayer/pull/6724#issuecomment-564650572).
     if (Color.alpha(backgroundColor) > 0) {
-      SpannableStringBuilder newCueText = new SpannableStringBuilder(cueText);
-      newCueText.setSpan(
-          new BackgroundColorSpan(backgroundColor), 0, newCueText.length(), Spanned.SPAN_PRIORITY);
-      cueText = newCueText;
+      if (edgeType == CaptionStyleCompat.EDGE_TYPE_NONE
+          || edgeType == CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW) {
+        cueText.setSpan(
+            new BackgroundColorSpan(backgroundColor), 0, cueText.length(), Spanned.SPAN_PRIORITY);
+      } else {
+        cueTextEdge.setSpan(
+            new BackgroundColorSpan(backgroundColor),
+            0,
+            cueTextEdge.length(),
+            Spanned.SPAN_PRIORITY);
+      }
     }
 
     Alignment textAlignment = cueTextAlignment == null ? Alignment.ALIGN_CENTER : cueTextAlignment;
@@ -366,6 +409,9 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
     // Update the derived drawing variables.
     this.textLayout = new StaticLayout(cueText, textPaint, textWidth, textAlignment, spacingMult,
         spacingAdd, true);
+    this.edgeLayout =
+        new StaticLayout(
+            cueTextEdge, textPaint, textWidth, textAlignment, spacingMult, spacingAdd, true);
     this.textLeft = textLeft;
     this.textTop = textTop;
     this.textPaddingX = textPaddingX;
@@ -405,8 +451,9 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
   }
 
   private void drawTextLayout(Canvas canvas) {
-    StaticLayout layout = textLayout;
-    if (layout == null) {
+    StaticLayout textLayout = this.textLayout;
+    StaticLayout edgeLayout = this.edgeLayout;
+    if (textLayout == null || edgeLayout == null) {
       // Nothing to draw.
       return;
     }
@@ -415,18 +462,34 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
     canvas.translate(textLeft, textTop);
 
     if (Color.alpha(windowColor) > 0) {
-      paint.setColor(windowColor);
-      canvas.drawRect(-textPaddingX, 0, layout.getWidth() + textPaddingX, layout.getHeight(),
-          paint);
+      windowPaint.setColor(windowColor);
+      canvas.drawRect(
+          -textPaddingX,
+          0,
+          textLayout.getWidth() + textPaddingX,
+          textLayout.getHeight(),
+          windowPaint);
     }
 
-    if (edgeType == CaptionStyleCompat.EDGE_TYPE_OUTLINE) {
+    if (mOutlineSpan != null) {
+      textPaint.setStrokeJoin(mOutlineSpan.getJoin());
+      textPaint.setStrokeWidth(mOutlineSpan.getStrokeWidth());
+      textPaint.setColor(mOutlineSpan.getStrokeColor());
+      textPaint.setStyle(mOutlineSpan.getStyle());
+      edgeLayout.draw(canvas);
+    }
+    if (mShadowSpan != null) {
+      textPaint.setShadowLayer(mShadowSpan.getRadius(), mShadowSpan.getDx(),
+          mShadowSpan.getDy(), mShadowSpan.getColor());
+      edgeLayout.draw(canvas);
+    }
+    if (mOutlineSpan != null && edgeType == CaptionStyleCompat.EDGE_TYPE_OUTLINE) {
       textPaint.setStrokeJoin(Join.ROUND);
       textPaint.setStrokeWidth(outlineWidth);
       textPaint.setColor(edgeColor);
       textPaint.setStyle(Style.FILL_AND_STROKE);
-      layout.draw(canvas);
-    } else if (edgeType == CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW) {
+      edgeLayout.draw(canvas);
+    } else if (mShadowSpan != null && edgeType == CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW) {
       textPaint.setShadowLayer(shadowRadius, shadowOffset, shadowOffset, edgeColor);
     } else if (edgeType == CaptionStyleCompat.EDGE_TYPE_RAISED
         || edgeType == CaptionStyleCompat.EDGE_TYPE_DEPRESSED) {
@@ -437,13 +500,13 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
       textPaint.setColor(foregroundColor);
       textPaint.setStyle(Style.FILL);
       textPaint.setShadowLayer(shadowRadius, -offset, -offset, colorUp);
-      layout.draw(canvas);
+      edgeLayout.draw(canvas);
       textPaint.setShadowLayer(shadowRadius, offset, offset, colorDown);
     }
 
     textPaint.setColor(foregroundColor);
     textPaint.setStyle(Style.FILL);
-    layout.draw(canvas);
+    textLayout.draw(canvas);
     textPaint.setShadowLayer(0, 0, 0, 0);
 
     canvas.restoreToCount(saveCount);
@@ -451,7 +514,7 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 
   @RequiresNonNull({"cueBitmap", "bitmapRect"})
   private void drawBitmapLayout(Canvas canvas) {
-    canvas.drawBitmap(cueBitmap, /* src= */ null, bitmapRect, /* paint= */ null);
+    canvas.drawBitmap(cueBitmap, /* src= */ null, bitmapRect, bitmapPaint);
   }
 
   /**
@@ -466,4 +529,5 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
     // equals methods, so we perform one explicitly here.
     return first == second || (first != null && first.equals(second));
   }
+
 }
